@@ -1,0 +1,17 @@
+# =========================================================
+# Tapo device list
+# =========================================================
+# Format (one device per line):
+#   Name,IP_Address
+#
+# - Lines starting with # are ignored (comments)
+# - Blank lines are ignored
+# - To add a new device in the future: just add a new line
+#   below with its Name and IP. No code changes needed -
+#   restart the script and it will pick it up automatically.
+# =========================================================
+
+TAPO_OLDER_SWITCH,192.168.31.100
+TAPO_NEW_SWITCH,192.168.31.101
+# Example - uncomment and edit the line below to add Device_2:
+# Device_3,192.168.31.101
