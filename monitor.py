@@ -15,6 +15,10 @@ PASSWORD = os.environ.get("PASSWORD")
 
 MIN_POWER = 5               # Ignore below this
 TRIGGER_POWER = 300         # Trigger below this
+HIGH_POWER_LIMIT = 3000      # SAFETY: turn off INSTANTLY if power reaches/exceeds this (Watts)
+                              # Check your plug's datasheet - most Tapo plugs are rated
+                              # around 2300W (10A @ 230V). Keep this comfortably BELOW
+                              # your plug's actual rated max, not at/above it.
 CHECK_INTERVAL = 5          # Seconds
 OFF_DURATION =  10*60      # 10 minutes
 
@@ -106,6 +110,7 @@ async def monitor_device(name, host):
 
     last_is_on = None     # last known ON/OFF state
     last_zone = None      # last known power zone: "LOW" or "NORMAL"
+    emergency_stop = False  # True once HIGH_POWER_LIMIT has tripped this device
 
     while True:
         try:
@@ -121,6 +126,31 @@ async def monitor_device(name, host):
             power = energy.current_consumption
 
             is_on = device.is_on
+
+            # --- SAFETY: instant emergency cutoff on dangerously high power ---
+            # Checked first, before anything else, every single cycle.
+            if is_on and power >= HIGH_POWER_LIMIT:
+                log_event(name, f"EMERGENCY: power {power:.2f} W >= {HIGH_POWER_LIMIT} W limit. "
+                                 f"Turning OFF immediately!")
+                await device.turn_off()
+
+                emergency_stop = True
+                script_turned_off = False   # this is not the normal low-power cycle
+                last_is_on = False
+                last_zone = None
+
+                log_event(name, "Device stopped for safety and will stay OFF. "
+                                 "Turn it back on manually (Tapo app) once it's safe.")
+
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+
+            # If a device that was emergency-stopped is manually turned back
+            # on (via the Tapo app), notice it and resume normal monitoring.
+            if emergency_stop and is_on:
+                log_event(name, "Device was manually turned back ON after an emergency stop. "
+                                 "Resuming normal monitoring.")
+                emergency_stop = False
 
             # Log ON/OFF changes (e.g. someone flips it manually, or the
             # script itself flips it - either way it's worth recording).
