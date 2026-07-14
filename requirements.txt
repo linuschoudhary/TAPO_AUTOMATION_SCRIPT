@@ -1,0 +1,10 @@
+# TAPO_AUTOMATION - Python dependencies
+# Tested on Ubuntu. Install with:
+#   pip install -r requirements.txt
+#
+# Only the two libraries the script directly imports are listed here.
+# Their own dependencies (aiohttp, cryptography, mashumaro, etc.) get
+# installed automatically by pip - no need to list those separately.
+
+python-kasa==0.10.2
+python-dotenv==1.2.2
