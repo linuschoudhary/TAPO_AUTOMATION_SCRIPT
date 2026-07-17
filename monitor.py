@@ -1,4 +1,5 @@
 import asyncio
+import time
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
@@ -14,12 +15,12 @@ EMAIL = os.environ.get("EMAIL")
 PASSWORD = os.environ.get("PASSWORD")
 
 MIN_POWER = 5               # Ignore below this
-TRIGGER_POWER = 300         # Trigger below this
-HIGH_POWER_LIMIT = 3000      # SAFETY: turn off INSTANTLY if power reaches/exceeds this (Watts)
+TRIGGER_POWER = 400         # Trigger below this
+HIGH_POWER_LIMIT = 30000      # SAFETY: turn off INSTANTLY if power reaches/exceeds this (Watts)
                               # Check your plug's datasheet - most Tapo plugs are rated
                               # around 2300W (10A @ 230V). Keep this comfortably BELOW
                               # your plug's actual rated max, not at/above it.
-CHECK_INTERVAL = 5          # Seconds
+CHECK_INTERVAL = 3          # Seconds
 OFF_DURATION =  10*60      # 10 minutes
 
 DEVICES_FILE = Path(__file__).parent / "devices.txt"
@@ -104,8 +105,18 @@ async def monitor_device(name, host):
     printed/logged for routine readings. We only log when something
     actually changes: the device turns on/off, or its power crosses
     the TRIGGER_POWER threshold.
+
+    NOTE ON THE OFF-WAIT PERIOD:
+    We do NOT block the loop with asyncio.sleep(OFF_DURATION) anymore.
+    Instead we record a resume_time timestamp and keep checking every
+    CHECK_INTERVAL like normal. This means:
+      - a network error during the wait can never get script_turned_off
+        stuck True forever (the old bug),
+      - the HIGH_POWER_LIMIT emergency cutoff keeps working even during
+        the wait, instead of being blind for 10 minutes.
     """
     script_turned_off = False
+    resume_time = 0        # timestamp (time.time()) at which we may auto turn back ON
     device = None
 
     last_is_on = None     # last known ON/OFF state
@@ -128,7 +139,8 @@ async def monitor_device(name, host):
             is_on = device.is_on
 
             # --- SAFETY: instant emergency cutoff on dangerously high power ---
-            # Checked first, before anything else, every single cycle.
+            # Checked first, before anything else, every single cycle - even
+            # while we're in the middle of the auto-turn-on wait below.
             if is_on and power >= HIGH_POWER_LIMIT:
                 log_event(name, f"EMERGENCY: power {power:.2f} W >= {HIGH_POWER_LIMIT} W limit. "
                                  f"Turning OFF immediately!")
@@ -152,13 +164,44 @@ async def monitor_device(name, host):
                                  "Resuming normal monitoring.")
                 emergency_stop = False
 
-            # Log ON/OFF changes (e.g. someone flips it manually, or the
-            # script itself flips it - either way it's worth recording).
+            # Log ON/OFF changes that we did NOT just cause ourselves.
+            # Every time the script itself calls turn_off()/turn_on(), it
+            # updates last_is_on immediately in the same breath, so this
+            # block never fires for the script's own actions - only for
+            # something external (you, flipping it in the Tapo app, or
+            # a physical/other cause). That's why this is tagged "(manual)".
             if last_is_on is not None and is_on != last_is_on:
-                log_event(name, f"Device is now {'ON' if is_on else 'OFF'}.")
+                log_event(name, f"Device is now {'ON' if is_on else 'OFF'} (manual).")
+
+                # If we were mid-wait to auto turn it back on, and you
+                # beat us to it by turning it ON yourself, cancel our plan.
+                if script_turned_off and is_on:
+                    log_event(name, "Device was manually turned ON during the wait period. "
+                                     "Canceling scheduled auto turn-ON.")
+                    script_turned_off = False
+
             last_is_on = is_on
 
-            # Plug already OFF - nothing else to check this cycle
+            # --- AUTO-TURN-ON (non-blocking): we're waiting out OFF_DURATION ---
+            if script_turned_off:
+                if not is_on and time.time() >= resume_time:
+                    log_event(name, "Turning ON...")
+                    await device.turn_on()
+
+                    script_turned_off = False
+                    last_is_on = True
+                    last_zone = None
+
+                    log_event(name, "Device turned back ON. Done.")
+
+                # Whether we just turned it on or are still waiting, keep
+                # polling at the normal short interval (so emergency cutoff
+                # and manual-override detection keep working meanwhile).
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+
+            # Plug already OFF (and not something we're auto-managing) -
+            # nothing else to check this cycle
             if not is_on:
                 last_zone = None
                 await asyncio.sleep(CHECK_INTERVAL)
@@ -179,7 +222,7 @@ async def monitor_device(name, host):
                                  f"Power back to normal ({power:.2f} W).")
                 last_zone = current_zone
 
-            # Trigger
+            # --- TRIGGER AUTO-OFF (non-blocking) ---
             if power < TRIGGER_POWER and not script_turned_off:
 
                 log_event(name, f"Low power detected ({power:.2f} W). Turning OFF...")
@@ -187,28 +230,21 @@ async def monitor_device(name, host):
                 await device.turn_off()
 
                 script_turned_off = True
+                resume_time = time.time() + OFF_DURATION
                 last_is_on = False
+                last_zone = None
 
-                log_event(name, "Waiting 10 minutes before turning back ON...")
-
-                await asyncio.sleep(OFF_DURATION)
-
-                if script_turned_off:
-                    log_event(name, "Turning ON...")
-
-                    await device.turn_on()
-
-                    script_turned_off = False
-                    last_is_on = True
-                    last_zone = None
-
-                    log_event(name, "Device turned back ON. Done.")
+                log_event(name, f"Waiting {OFF_DURATION // 60} minutes before turning back ON...")
 
             await asyncio.sleep(CHECK_INTERVAL)
 
         except Exception as e:
             # Errors for this device are isolated here - only this
             # device will pause/reconnect, other devices keep running.
+            # NOTE: script_turned_off and resume_time are deliberately left
+            # untouched here. If we errored out mid-wait, we still remember
+            # to turn the device back on once reconnected and resume_time
+            # has passed - this is the fix for the old "stuck OFF forever" bug.
             log_event(name, f"ERROR: {e}")
             log_event(name, "Reconnecting in 5 seconds...")
 
