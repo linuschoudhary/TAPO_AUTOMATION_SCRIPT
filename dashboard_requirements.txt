@@ -1,0 +1,16 @@
+# Extra dependencies for dashboard.py (the Streamlit control panel).
+#
+# This is a SEPARATE list from requirements.txt on purpose - it does
+# NOT change or replace requirements.txt, it only adds what the
+# dashboard needs on top of it.
+#
+# Install into the SAME virtual environment you already use for
+# monitor.py:
+#
+#   source venv/bin/activate
+#   pip install -r requirements.txt
+#   pip install -r dashboard_requirements.txt
+
+streamlit>=1.32
+streamlit-autorefresh>=1.0.1
+pandas>=2.0
