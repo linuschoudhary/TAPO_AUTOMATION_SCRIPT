@@ -4,27 +4,30 @@ TAPO_AUTOMATION_SCRIPT monitor.
 
 WHAT THIS FILE IS
 ------------------
-This is a NEW, separate file. It does NOT import-and-run monitor.py's
+This is a separate file. It does NOT import-and-run monitor.py's
 automation loop, and it never writes to monitor.py, devices.txt, or
 .env. It only:
 
   1. Reads devices.txt (through monitor.load_devices(), read-only)
      to know which devices exist.
-  2. Reads logs/monitor.log (read-only) to build a plain-English
-     history and figure out "why is this device off right now".
-  3. Talks directly to your Tapo plugs on the network (same as the
+  2. Reads logs/usage_history.json (through history.py, read-only) to
+     show total ON time and the list of ON/OFF periods for any day -
+     this is a small structured file that monitor.py writes to
+     directly the moment a device's state changes, so the dashboard
+     never has to parse the (potentially large) text log just to work
+     out "how long was this on today".
+  3. Reads logs/monitor.log (read-only, cached) only for the human-
+     readable "Logs" section at the bottom of the page and to work
+     out *why* a device is currently off (idle auto-off countdown,
+     emergency stop, etc).
+  4. Talks directly to your Tapo plugs on the network (same as the
      Tapo phone app would) to show live ON/OFF + current power, and
-     to let you turn a plug on/off with a button. monitor.py already
-     treats an external on/off (from the Tapo app, or from here) as
-     a normal "manual" action and handles it safely - it does not
-     get confused or break anything.
+     to let you turn a plug on/off with a button.
 
 WHERE TO RUN IT
 ----------------
 Put this file in the SAME folder as your running monitor.py (the
-same folder that has devices.txt, .env and the logs/ folder), on
-whichever machine actually runs monitor.py continuously. See
-DASHBOARD_README.md for full setup steps.
+same folder that has devices.txt, .env and the logs/ folder):
 
     streamlit run dashboard.py --server.address 0.0.0.0
 
@@ -36,7 +39,7 @@ import asyncio
 import os
 import re
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -48,6 +51,7 @@ from kasa import Discover
 # main()/asyncio.run(main()) never executes. We only reuse its config
 # constants and its devices.txt reader. Nothing here writes to it.
 import monitor
+import history
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -94,37 +98,30 @@ LOG_LINE_RE = re.compile(
     r"^\[(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s\[(?P<device>[^\]]+)\]\s(?P<msg>.*)$"
 )
 
-CATEGORY_LABELS = {
-    "connected": "🔗 Connected",
-    "emergency_off": "🚨 Emergency shut-off",
-    "emergency_confirm": "🚨 Emergency (stays off)",
-    "emergency_resumed": "✅ Resumed after emergency",
-    "manual_on": "🟢 Turned ON manually",
-    "manual_off": "🔴 Turned OFF manually",
-    "cancel_auto_on": "ℹ️ Auto turn-on cancelled",
-    "power_low_zone": "⚠️ Power dropped low",
-    "power_normal_zone": "✅ Power back to normal",
-    "auto_off_triggered": "🔻 Auto OFF (low power)",
-    "auto_off_wait": "⏳ Waiting to auto turn-on",
-    "auto_on_start": "🔼 Auto turning ON",
-    "auto_on_done": "🟢 Auto turned ON",
-    "error": "❗ Problem / error",
-    "reconnecting": "🔄 Reconnecting",
-    "system": "🖥️ System message",
-    "other": "• Other",
-}
+# Categories that mean "the device turned/became ON" vs "OFF" - used
+# both to work out the current state and to build today's ON periods.
+# "reconnect_on"/"reconnect_off" are the explicit state re-confirmation
+# logged the moment a device comes back from an outage (see monitor.py) -
+# they're treated exactly like a real ON/OFF change so a period never
+# silently spans straight across a gap where the device was unreachable.
+STATE_ON = {"auto_on_done", "manual_on", "emergency_resumed", "reconnect_on"}
+STATE_OFF = {"auto_off_triggered", "emergency_off", "manual_off", "reconnect_off"}
 
-# Categories that establish a device's current on/off state (most
-# recent one of these, scanning backwards, wins).
-STATE_ON = {"auto_on_done", "manual_on", "emergency_resumed"}
-STATE_OFF_AUTO = {"auto_off_triggered"}
-STATE_OFF_EMERGENCY = {"emergency_off"}
-STATE_OFF_MANUAL = {"manual_off"}
+# Categories bucketed as "a problem worth looking at" for the log filter.
+PROBLEM_CATEGORIES = {"offline", "emergency_off", "emergency_confirm", "error"}
 
 
 def classify(msg: str) -> dict:
     if msg.startswith("Connected ("):
         return dict(category="connected", icon="🔗", friendly="Connected to the plug")
+    if msg.startswith("Back online - device is currently ON"):
+        return dict(category="reconnect_on", icon="🔌",
+                     friendly="Back online — confirmed ON")
+    if msg.startswith("Back online - device is currently OFF"):
+        return dict(category="reconnect_off", icon="🔌",
+                     friendly="Back online — confirmed OFF")
+    if msg.startswith("Not available right now"):
+        return dict(category="offline", icon="🔌", friendly="Offline / unreachable")
     if msg.startswith("EMERGENCY:"):
         p = extract_power(msg)
         return dict(category="emergency_off", icon="🚨",
@@ -134,16 +131,14 @@ def classify(msg: str) -> dict:
                      friendly="Stays OFF until turned back on manually")
     if msg.startswith("Device was manually turned back ON after an emergency stop"):
         return dict(category="emergency_resumed", icon="✅",
-                     friendly="Manually turned back on after emergency stop — monitoring resumed")
+                     friendly="Manually turned back on after emergency stop")
     if re.match(r"^Device is now ON \(manual\)\.$", msg):
-        return dict(category="manual_on", icon="🟢",
-                     friendly="Turned ON manually (Tapo app / dashboard)")
+        return dict(category="manual_on", icon="🟢", friendly="Turned ON")
     if re.match(r"^Device is now OFF \(manual\)\.$", msg):
-        return dict(category="manual_off", icon="🔴",
-                     friendly="Turned OFF manually (Tapo app / dashboard)")
+        return dict(category="manual_off", icon="🔴", friendly="Turned OFF")
     if msg.startswith("Device was manually turned ON during the wait period"):
         return dict(category="cancel_auto_on", icon="ℹ️",
-                     friendly="Planned auto turn-on cancelled — someone turned it on early")
+                     friendly="Planned auto turn-on cancelled — turned on early")
     if msg.startswith("Power dropped below"):
         p = extract_power(msg)
         return dict(category="power_low_zone", icon="⚠️",
@@ -155,7 +150,7 @@ def classify(msg: str) -> dict:
     if msg.startswith("Low power detected"):
         p = extract_power(msg)
         return dict(category="auto_off_triggered", icon="🔻",
-                     friendly=f"Low power ({p} W) — turning OFF automatically")
+                     friendly=f"Low power ({p} W) — turned OFF automatically")
     if msg.startswith("Waiting"):
         mins = extract_wait_minutes(msg)
         return dict(category="auto_off_wait", icon="⏳",
@@ -166,6 +161,8 @@ def classify(msg: str) -> dict:
     if msg.startswith("Device turned back ON. Done."):
         return dict(category="auto_on_done", icon="🟢",
                      friendly="Turned back ON automatically")
+    # Legacy lines from before the logging cleanup - old log files may
+    # still contain these; keep them readable instead of erroring out.
     if msg.startswith("ERROR:"):
         return dict(category="error", icon="❗", friendly=f"Problem: {msg[len('ERROR:'):].strip()}")
     if msg.startswith("Reconnecting"):
@@ -203,6 +200,34 @@ def parse_log_lines(lines):
     return events
 
 
+def _log_fingerprint(path: Path):
+    """
+    Cheap way to tell whether the log file has actually changed since
+    we last read it (modified time + size), without reading its
+    contents. Used as the cache key below.
+    """
+    try:
+        stat = path.stat()
+        return (stat.st_mtime_ns, stat.st_size)
+    except FileNotFoundError:
+        return (0, 0)
+
+
+@st.cache_data(show_spinner=False)
+def _load_events(fingerprint, max_lines: int = 5000):
+    """
+    Reads and parses the log file, cached and keyed on the file's
+    fingerprint. Streamlit reruns this whole script on every refresh
+    and every auto-refresh tick, so WITHOUT this cache we'd re-read
+    and re-parse the entire log file from scratch every single time -
+    that's what was making every refresh feel slow. With the cache,
+    the (possibly expensive) read+parse only happens again when the
+    log file has actually changed.
+    """
+    lines = read_last_log_lines(monitor.LOG_FILE, max_lines=max_lines)
+    return parse_log_lines(lines)
+
+
 def resolve_device_state(events_for_device):
     """
     Scan a single device's events backwards (most recent first) and
@@ -226,23 +251,46 @@ def resolve_device_state(events_for_device):
             result["state"] = "on"
             result["since"] = ev["ts"]
             break
-        if cat in STATE_OFF_AUTO:
+        if cat == "auto_off_triggered":
             result["state"] = "off_auto"
             result["since"] = ev["ts"]
             mins = wait_minutes if wait_minutes is not None else (monitor.OFF_DURATION // 60)
             result["wait_minutes"] = mins
             result["resume_at"] = ev["ts"] + timedelta(minutes=mins)
             break
-        if cat in STATE_OFF_EMERGENCY:
+        if cat == "emergency_off":
             result["state"] = "off_emergency"
             result["since"] = ev["ts"]
             break
-        if cat in STATE_OFF_MANUAL:
+        if cat == "manual_off":
+            result["state"] = "off_manual"
+            result["since"] = ev["ts"]
+            break
+        if cat == "reconnect_off":
+            # Came back online after being unreachable and is OFF right
+            # now. We don't know exactly when during the gap it turned
+            # off, only that it's confirmed OFF as of this reconnect -
+            # treat it like a manual OFF for display purposes.
             result["state"] = "off_manual"
             result["since"] = ev["ts"]
             break
 
     return result
+
+
+def format_duration(td: timedelta) -> str:
+    total_seconds = max(int(td.total_seconds()), 0)
+    if total_seconds == 0:
+        return "0m"
+    if total_seconds < 60:
+        return f"{total_seconds}s"
+    hours, rem = divmod(total_seconds, 3600)
+    minutes = rem // 60
+    if hours and minutes:
+        return f"{hours}h {minutes}m"
+    if hours:
+        return f"{hours}h"
+    return f"{minutes}m"
 
 
 # ==========================================================
@@ -295,14 +343,14 @@ def run_async(coro):
 # Page setup
 # ==========================================================
 
-st.set_page_config(page_title="Power Monitor", page_icon="🔌",
+st.set_page_config(page_title="Tapo Control", page_icon="🔌",
                     layout="centered", initial_sidebar_state="collapsed")
 
 st.markdown(
     """
     <style>
-    div.stButton > button { font-size: 1.05rem; padding: 0.6rem 0.5rem; }
-    [data-testid="stMetricValue"] { font-size: 1.6rem; }
+    div.stButton > button { font-size: 1rem; padding: 0.5rem 0.5rem; }
+    [data-testid="stMetricValue"] { font-size: 1.3rem; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -314,9 +362,8 @@ def require_pin():
         return
     if st.session_state.get("dashboard_pin_ok"):
         return
-    st.title("🔌 Power Monitor")
-    st.write("Enter the PIN to continue.")
-    pin_input = st.text_input("PIN", type="password", key="pin_input")
+    st.markdown("#### 🔌 Enter PIN")
+    pin_input = st.text_input("PIN", type="password", key="pin_input", label_visibility="collapsed")
     if st.button("Unlock"):
         if pin_input == DASHBOARD_PIN:
             st.session_state["dashboard_pin_ok"] = True
@@ -330,20 +377,18 @@ require_pin()
 
 
 def run_dashboard():
-    st.title("🔌 Power Monitor")
-    st.caption("Live status and history for your smart plugs")
-
+    # ---- Top bar: refresh controls only, no big heading (this is opened on a phone) ----
     top_col1, top_col2 = st.columns([1, 1])
     with top_col1:
-        if st.button("🔄 Refresh now", use_container_width=True):
+        if st.button("🔄 Refresh", use_container_width=True):
             st.rerun()
     with top_col2:
         if HAS_AUTOREFRESH:
-            auto = st.checkbox("Auto-refresh (20s)", value=True)
+            auto = st.checkbox("Auto-refresh", value=True)
             if auto:
                 st_autorefresh(interval=20_000, key="auto_refresh")
         else:
-            st.checkbox("Auto-refresh (20s)", value=False, disabled=True,
+            st.checkbox("Auto-refresh", value=False, disabled=True,
                          help="Run: pip install streamlit-autorefresh to enable this")
 
     try:
@@ -360,23 +405,42 @@ def run_dashboard():
         st.stop()
         return
 
-    log_lines = read_last_log_lines(monitor.LOG_FILE, max_lines=5000)
-    events = parse_log_lines(log_lines)
+    events = _load_events(_log_fingerprint(monitor.LOG_FILE))
     events_by_device = {name: [e for e in events if e["device"] == name] for name, _ in devices}
+
+    history_data = history.load_all()
+
+    # ---- Date picker - browse any past day's ON/OFF record, not just today ----
+    avail_dates = history.available_dates(history_data)
+    min_date = min(avail_dates) if avail_dates else date.today()
+    selected_date = st.date_input(
+        "📅 Viewing history for", value=date.today(),
+        min_value=min_date, max_value=date.today(),
+    )
+    is_today = selected_date == date.today()
 
     with st.spinner("Checking your devices…"):
         live = run_async(get_all_live_status(devices))
 
-    st.caption(f"Last checked: {datetime.now().strftime('%d %b, %I:%M:%S %p')}")
+    st.caption(f"Last checked: {datetime.now().strftime('%I:%M:%S %p')}")
 
-    # ---- Build combined state per device (live status wins over log guess) ----
+    # ---- Build combined state + today's ON-time per device (live status wins) ----
     rows = []
     counts = {"on": 0, "off_auto": 0, "off_emergency": 0, "off_manual": 0,
               "off_other": 0, "unreachable": 0}
 
     for name, ip in devices:
         li = live.get(name, {"ok": False, "error": "no data"})
-        log_state = resolve_device_state(events_by_device.get(name, []))
+        dev_events = events_by_device.get(name, [])
+        log_state = resolve_device_state(dev_events)
+        periods, total_on = history.get_periods_for_date(name, selected_date, data=history_data)
+
+        # "Since" times for the live status badge come straight from the
+        # structured history file (not the log) - it's the authoritative,
+        # already-accurate record of exactly when the current ON/OFF
+        # period started, regardless of which date is being browsed above.
+        on_since = history.current_open_period_start(name, data=history_data)
+        off_since = history.last_off_time(name, data=history_data)
 
         if not li.get("ok"):
             combined = "unreachable"
@@ -400,164 +464,129 @@ def run_dashboard():
                 counts["off_other"] += 1
 
         rows.append({"name": name, "ip": ip, "live": li, "log_state": log_state,
-                      "combined": combined})
+                      "combined": combined, "periods": periods, "total_on": total_on,
+                      "on_since": on_since, "off_since": off_since})
 
     # ---- Summary strip ----
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Devices", len(devices))
     m2.metric("🟢 ON", counts["on"])
     m3.metric("🔴 OFF", counts["off_auto"] + counts["off_manual"] + counts["off_other"])
-    m4.metric("🚨 Emergency", counts["off_emergency"])
+    m4.metric("🚨 Emerg.", counts["off_emergency"])
     if counts["unreachable"]:
-        st.warning(f"⚪ {counts['unreachable']} device(s) can't be reached right now "
-                    "(check their WiFi / power).")
+        st.warning(f"⚪ {counts['unreachable']} device(s) can't be reached right now.")
 
-    st.divider()
-
-    # ---- Per-device cards ----
+    # ---- Per-device compact cards ----
+    date_label = "today" if is_today else selected_date.strftime("%d %b")
     for row in rows:
         name, ip, li, log_state, combined = (
             row["name"], row["ip"], row["live"], row["log_state"], row["combined"]
         )
-        dev_events = events_by_device.get(name, [])
+        total_on_str = format_duration(row["total_on"])
+        on_since = row["on_since"]
+        off_since = row["off_since"]
 
         with st.container(border=True):
-            st.subheader(pretty(name))
-            st.caption(f"`{name}` · {ip}")
+            st.markdown(f"**{pretty(name)}**  ({total_on_str} {date_label})")
 
+            # ---- one-line status (always LIVE / right now, regardless of
+            # which date is selected above - the date picker only changes
+            # the historical record shown in the expander below) ----
             if combined == "unreachable":
-                st.error("⚪ Can't reach this plug right now")
-                err = li.get("error", "")[:160]
-                st.caption(f"({err})" if err else "")
-                st.caption("Check its WiFi / power. monitor.py keeps retrying automatically "
-                            "in the background.")
+                st.error("⚪ Unreachable right now")
             elif combined == "on":
                 power = li.get("power", 0) or 0
-                st.success(f"🟢 ON — using {power:.0f} W right now")
+                since_txt = f" · on since {on_since.strftime('%I:%M %p')}" if on_since else ""
+                st.success(f"🟢 ON — {power:.0f} W{since_txt}")
             elif combined == "off_emergency":
-                st.error("🚨 Stopped for SAFETY — power spiked too high")
-                since = log_state["since"]
-                since_txt = since.strftime("%d %b, %I:%M %p") if since else "recently"
-                st.caption(f"Tripped: {since_txt}. This will stay OFF until turned back on "
-                            "by hand — check the appliance/wiring is safe first, then use "
-                            "the button below (or the Tapo app).")
+                since = off_since or log_state["since"]
+                since_txt = since.strftime("%I:%M %p") if since else "recently"
+                st.error(f"🚨 Safety stop at {since_txt} — turn back on by hand once it's safe")
             elif combined == "off_auto":
-                st.warning("🔴 OFF automatically — power was low (device idle/finished)")
                 resume_at = log_state.get("resume_at")
                 if resume_at:
                     remaining = (resume_at - datetime.now()).total_seconds()
-                    total = (log_state.get("wait_minutes") or (monitor.OFF_DURATION // 60)) * 60
                     if remaining > 0:
                         mins, secs = divmod(int(remaining), 60)
-                        st.info(f"⏳ Turns back ON automatically in **{mins}m {secs}s** "
-                                f"(around {resume_at.strftime('%I:%M %p')})")
-                        frac = 0.0
-                        if total > 0:
-                            frac = min(max((total - remaining) / total, 0.0), 1.0)
-                        st.progress(frac)
+                        st.warning(f"🔴 OFF (idle) — back ON in {mins}m {secs}s")
                     else:
-                        st.info("⏳ About to turn back ON automatically (any moment now)")
+                        st.warning("🔴 OFF (idle) — turning back ON any moment")
                 else:
-                    st.caption("It should turn back on automatically before long.")
+                    st.warning("🔴 OFF (idle) — will resume automatically")
             elif combined == "off_manual":
-                since = log_state["since"]
-                since_txt = f" at {since.strftime('%d %b, %I:%M %p')}" if since else ""
-                st.warning(f"🔴 OFF — turned off manually{since_txt}")
+                since = off_since or log_state["since"]
+                since_txt = f" since {since.strftime('%I:%M %p')}" if since else ""
+                st.warning(f"🔴 OFF{since_txt}")
             else:
                 st.warning("🔴 OFF")
 
-            # ---- Control button ----
+            # ---- control button ----
             can_control = li.get("ok", False)
             is_on_now = bool(li.get("is_on"))
             if can_control:
-                if is_on_now:
-                    if st.button(f"🔴 Turn {pretty(name)} OFF", key=f"off_{name}",
-                                  use_container_width=True):
-                        try:
-                            with st.spinner(f"Turning {pretty(name)} off…"):
-                                run_async(set_device_power(ip, False))
-                            st.toast(f"{pretty(name)} turned OFF", icon="🔴")
-                        except Exception as e:  # noqa: BLE001
-                            st.error(f"Couldn't turn it off: {e}")
-                        st.rerun()
-                else:
-                    if st.button(f"🟢 Turn {pretty(name)} ON", key=f"on_{name}",
-                                  use_container_width=True, type="primary"):
-                        try:
-                            with st.spinner(f"Turning {pretty(name)} on…"):
-                                run_async(set_device_power(ip, True))
-                            st.toast(f"{pretty(name)} turned ON", icon="🟢")
-                        except Exception as e:  # noqa: BLE001
-                            st.error(f"Couldn't turn it on: {e}")
-                        st.rerun()
+                label = "🔴 Turn OFF" if is_on_now else "🟢 Turn ON"
+                btn_type = "secondary" if is_on_now else "primary"
+                if st.button(label, key=f"toggle_{name}", use_container_width=True, type=btn_type):
+                    try:
+                        with st.spinner(f"Switching {pretty(name)}…"):
+                            run_async(set_device_power(ip, not is_on_now))
+                        st.toast(f"{pretty(name)} turned {'OFF' if is_on_now else 'ON'}",
+                                 icon="🔴" if is_on_now else "🟢")
+                    except Exception as e:  # noqa: BLE001
+                        st.error(f"Couldn't switch it: {e}")
+                    st.rerun()
             else:
-                st.button(f"Turn {pretty(name)} ON/OFF", key=f"disabled_{name}",
+                st.button("Turn ON/OFF", key=f"disabled_{name}",
                            use_container_width=True, disabled=True,
                            help="Can't control it while it's unreachable")
 
-            with st.expander(f"📜 Recent activity — {pretty(name)}"):
-                if not dev_events:
-                    st.caption("No history recorded yet for this device.")
+            # ---- full ON/OFF record for the selected date, collapsed to save space ----
+            with st.expander(f"📅 Record for {date_label} — {total_on_str} ON total"):
+                if not row["periods"]:
+                    st.caption(f"No ON time recorded for {date_label}.")
                 else:
-                    for ev in reversed(dev_events[-15:]):
+                    for s, e in reversed(row["periods"]):
+                        same_day_end = "" if e.date() == s.date() else " (next day)"
                         st.markdown(
-                            f"{ev['icon']} **{ev['ts'].strftime('%d %b, %I:%M:%S %p')}** — "
-                            f"{ev['friendly']}"
+                            f"🟢 {s.strftime('%I:%M %p')} – {e.strftime('%I:%M %p')}{same_day_end}"
+                            f"  &nbsp; *({format_duration(e - s)})*"
                         )
 
     st.divider()
 
-    # ---- Plain-English settings summary ----
-    with st.expander("⚙️ How the automation is set up"):
-        st.markdown(
-            f"""
-- **Auto-off (low power):** if a plug's power draw drops below
-  **{monitor.TRIGGER_POWER} W**, it's treated as *"device finished / idle"*
-  and that plug turns **OFF** automatically.
-- **Auto turn-back-on:** after an auto-off, the plug waits
-  **{monitor.OFF_DURATION // 60} minutes**, then turns itself back **ON**.
-- **Emergency safety cutoff:** if power reaches **{monitor.HIGH_POWER_LIMIT} W**,
-  the plug turns OFF *instantly* and **stays off** — it will **not** come back
-  on by itself. Someone needs to check it's safe, then turn it back on by
-  hand (button above, or the Tapo app).
-- **Check frequency:** each plug's power is checked every
-  **{monitor.CHECK_INTERVAL} seconds**.
-- **Ignored readings:** anything under **{monitor.MIN_POWER} W** is treated as
-  "nothing plugged in / idle" and ignored.
-
-These numbers come directly from the running automation script - if they're
-ever changed there, this page will show the new values automatically.
-            """
-        )
-
-    # ---- Full history ----
-    st.subheader("📚 Full History")
+    # ---- One combined log section for both devices (simple dropdowns, not multiselect) ----
+    st.markdown("**📜 Logs**")
 
     all_names = [n for n, _ in devices]
-    f_col1, f_col2 = st.columns(2)
-    with f_col1:
-        sel_devices = st.multiselect("Devices", options=all_names, default=all_names)
-    with f_col2:
-        present_cats = sorted(set(e["category"] for e in events))
-        sel_cats = st.multiselect(
-            "Event type", options=present_cats, default=present_cats,
-            format_func=lambda c: CATEGORY_LABELS.get(c, c),
-        )
-    search = st.text_input("Search (optional)", placeholder="e.g. a date, a word from the message…")
+    f1, f2 = st.columns(2)
+    with f1:
+        device_choice = st.selectbox("Device", options=["All devices"] + [pretty(n) for n in all_names])
+    with f2:
+        type_choice = st.selectbox("Show", options=["Everything", "On / Off changes", "Problems only"])
+    search = st.text_input("Search (optional)", placeholder="a date or word…")
 
-    filtered = [e for e in events if e["device"] in sel_devices and e["category"] in sel_cats]
+    filtered = events
+    if device_choice != "All devices":
+        target = next(n for n in all_names if pretty(n) == device_choice)
+        filtered = [e for e in filtered if e["device"] == target]
+
+    if type_choice == "On / Off changes":
+        filtered = [e for e in filtered if e["category"] in (STATE_ON | STATE_OFF)]
+    elif type_choice == "Problems only":
+        filtered = [e for e in filtered if e["category"] in PROBLEM_CATEGORIES]
+
     if search:
         s = search.lower()
         filtered = [e for e in filtered if s in e["msg"].lower() or s in e["device"].lower()]
+
     filtered = sorted(filtered, key=lambda e: e["ts"], reverse=True)
 
-    st.caption(f"Showing {len(filtered)} of {len(events)} recorded events "
-                f"(most recent {len(log_lines)} log lines scanned).")
+    st.caption(f"Showing {len(filtered)} of {len(events)} recorded events.")
 
     if filtered:
         show = filtered[:500]
         df = pd.DataFrame([{
-            "Time": e["ts"].strftime("%d %b %Y, %I:%M:%S %p"),
+            "Time": e["ts"].strftime("%d %b, %I:%M:%S %p"),
             "Device": pretty(e["device"]),
             "Event": f"{e['icon']} {e['friendly']}",
         } for e in show])
@@ -573,11 +602,6 @@ ever changed there, this page will show the new values automatically.
     st.download_button("⬇️ Download full raw log file", data=log_bytes,
                         file_name="monitor.log", mime="text/plain",
                         disabled=not log_bytes, use_container_width=True)
-
-    st.divider()
-    st.caption("This dashboard only talks to your own plugs on your own network. "
-                "Nothing is sent anywhere else. It never edits monitor.py, devices.txt, "
-                "or your .env file.")
 
 
 try:

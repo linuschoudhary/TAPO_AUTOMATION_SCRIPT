@@ -5,6 +5,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 from kasa import Discover
 import os
+
+import history
 # ==========================
 # Configuration (shared by all devices, same account)
 # ==========================
@@ -21,7 +23,7 @@ HIGH_POWER_LIMIT = 30000      # SAFETY: turn off INSTANTLY if power reaches/exce
                               # around 2300W (10A @ 230V). Keep this comfortably BELOW
                               # your plug's actual rated max, not at/above it.
 CHECK_INTERVAL = 3          # Seconds
-OFF_DURATION =  10*60      # 10 minutes
+OFF_DURATION =  60*60      # 60 minutes
 
 DEVICES_FILE = Path(__file__).parent / "devices.txt"
 
@@ -122,11 +124,29 @@ async def monitor_device(name, host):
     last_is_on = None     # last known ON/OFF state
     last_zone = None      # last known power zone: "LOW" or "NORMAL"
     emergency_stop = False  # True once HIGH_POWER_LIMIT has tripped this device
+    offline_logged = False  # True once we've logged the single "offline" message
+                             # for the CURRENT outage - reset back to False the
+                             # moment we successfully reconnect, so the next
+                             # outage logs its own single message too.
+    just_reconnected = False  # True for exactly one cycle right after we come
+                               # back from a real outage - see below. While the
+                               # device was unreachable we had NO visibility into
+                               # its ON/OFF state (it may have lost power and come
+                               # back defaulting to ON, or been flipped by hand
+                               # while we couldn't see it), so last_is_on can be
+                               # stale. This flag makes the very first reading
+                               # after reconnecting log a fresh, explicit "here's
+                               # the current state" line instead of silently
+                               # assuming nothing happened during the gap.
 
     while True:
         try:
             if device is None:
+                was_recovering = offline_logged  # True only if this reconnect follows a logged outage
                 device = await connect(name, host)
+                offline_logged = False  # back online - next outage logs again
+                if was_recovering:
+                    just_reconnected = True
 
             await device.update()
 
@@ -137,6 +157,35 @@ async def monitor_device(name, host):
             power = energy.current_consumption
 
             is_on = device.is_on
+
+            # Keep the structured ON/OFF history (logs/usage_history.json)
+            # in sync with whatever we just read from the device. This is
+            # idempotent (a no-op if nothing actually changed), so it's
+            # safe to call every single cycle as a catch-all - it covers
+            # manual toggles from the Tapo app/dashboard and anything else
+            # not explicitly handled below. The specific action points
+            # further down (emergency cutoff, auto-off, auto-on) ALSO call
+            # this directly so the recorded timestamp is exact rather than
+            # waiting up to CHECK_INTERVAL seconds for this generic check
+            # to catch up.
+            if is_on:
+                history.record_on(name)
+            else:
+                history.record_off(name)
+
+            # We had NO visibility into this device's ON/OFF state for the
+            # entire time it was unreachable - it might have lost power and
+            # come back defaulting to ON, or someone flipped it by hand while
+            # we couldn't see it. Rather than silently trust the old
+            # last_is_on from before the outage (which would make the
+            # dashboard think it's been continuously ON/OFF since way
+            # earlier, hiding the gap entirely), log the freshly-confirmed
+            # state as a clean new starting point.
+            if just_reconnected:
+                log_event(name, f"Back online - device is currently {'ON' if is_on else 'OFF'}.")
+                last_is_on = is_on
+                last_zone = None
+                just_reconnected = False
 
             # --- SAFETY: instant emergency cutoff on dangerously high power ---
             # Checked first, before anything else, every single cycle - even
@@ -150,6 +199,7 @@ async def monitor_device(name, host):
                 script_turned_off = False   # this is not the normal low-power cycle
                 last_is_on = False
                 last_zone = None
+                history.record_off(name)
 
                 log_event(name, "Device stopped for safety and will stay OFF. "
                                  "Turn it back on manually (Tapo app) once it's safe.")
@@ -191,6 +241,7 @@ async def monitor_device(name, host):
                     script_turned_off = False
                     last_is_on = True
                     last_zone = None
+                    history.record_on(name)
 
                     log_event(name, "Device turned back ON. Done.")
 
@@ -233,6 +284,7 @@ async def monitor_device(name, host):
                 resume_time = time.time() + OFF_DURATION
                 last_is_on = False
                 last_zone = None
+                history.record_off(name)
 
                 log_event(name, f"Waiting {OFF_DURATION // 60} minutes before turning back ON...")
 
@@ -245,8 +297,23 @@ async def monitor_device(name, host):
             # untouched here. If we errored out mid-wait, we still remember
             # to turn the device back on once reconnected and resume_time
             # has passed - this is the fix for the old "stuck OFF forever" bug.
-            log_event(name, f"ERROR: {e}")
-            log_event(name, "Reconnecting in 5 seconds...")
+            #
+            # IMPORTANT: we do NOT log every failed reconnect attempt anymore.
+            # A plug switched off at the wall fails to connect every single
+            # cycle, which used to flood the log with an "ERROR: ..." +
+            # "Reconnecting in 5 seconds..." pair every few seconds. Instead
+            # we log ONE line the moment it first goes unreachable, then stay
+            # silent and keep quietly retrying in the background. The
+            # offline_logged flag (reset to False on the next successful
+            # connect, above) is what lets the *next* real outage log again.
+            if not offline_logged:
+                log_event(name, "Not available right now - it is offline.")
+                offline_logged = True
+                # We've lost visibility into this device entirely - stop
+                # crediting ON time until we get a fresh confirmation it's
+                # actually back on (see just_reconnected / "Back online"
+                # above). Idempotent - harmless if it was already off.
+                history.record_off(name)
 
             device = None
             await asyncio.sleep(5)
